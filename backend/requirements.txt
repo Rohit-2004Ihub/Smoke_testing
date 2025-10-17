@@ -1,0 +1,15 @@
+fastapi
+uvicorn
+httpx
+python-dotenv
+langchain
+langchain-google-genai
+pydantic
+subprocess-run
+fastapi
+uvicorn[standard]
+python-dotenv
+requests
+python-jose
+pydantic
+

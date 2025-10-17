@@ -11,8 +11,12 @@ import {
   Search,
   Code2,
   Activity,
-  AlertCircle
+  AlertCircle,
+  Download
 } from "lucide-react";
+import { jsPDF } from "jspdf";
+import { Document, Packer, Paragraph, TextRun } from "docx";
+import { saveAs } from "file-saver";
 
 const API_BASE = "http://localhost:8080"; // FastAPI backend
 
@@ -96,25 +100,176 @@ function App() {
     try {
       setIsRunning(true);
       setError("");
+      setReport(null);
       const repoUrl = selectedRepo.startsWith("http") ? selectedRepo : `https://github.com/${selectedRepo}`;
       const res = await axios.post(`${API_BASE}/smoke/run`, {
         repo_url: repoUrl,
         branch: selectedBranch,
         commit_id: null
       });
-      console.log("Smoke Test Report:", res.data);
       setReport(res.data || {});
     } catch (err) {
       console.error(err);
-      setError("Failed to run smoke tests");
+      // attempt to show backend error message if present
+      const msg = err?.response?.data?.detail || err.message || "Failed to run smoke tests";
+      setError(msg);
     } finally {
       setIsRunning(false);
     }
   };
 
+  // Helpers to flatten/format report fields into strings
+  const stringifyItem = (item) => {
+    if (!item && item !== 0) return "";
+    if (typeof item === "string") return item;
+    try {
+      return JSON.stringify(item, null, 2);
+    } catch {
+      return String(item);
+    }
+  };
+
+  // PDF generator using jsPDF with wrapping + pagination
+  const downloadPDF = (reportObj) => {
+    const doc = new jsPDF({ unit: "pt", format: "a4" });
+    const margin = 40;
+    const pageWidth = doc.internal.pageSize.getWidth();
+    const maxWidth = pageWidth - margin * 2;
+    const lineHeight = 12;
+    let y = 40;
+
+    const addTitle = (text, fontSize = 16) => {
+      doc.setFontSize(fontSize);
+      doc.text(text, margin, y);
+      y += fontSize + 8;
+    };
+
+    const addParagraph = (text, fontSize = 11) => {
+      doc.setFontSize(fontSize);
+      const lines = doc.splitTextToSize(text, maxWidth);
+      lines.forEach((ln) => {
+        if (y + lineHeight > doc.internal.pageSize.getHeight() - margin) {
+          doc.addPage();
+          y = margin;
+        }
+        doc.text(ln, margin, y);
+        y += lineHeight;
+      });
+    };
+
+    addTitle("Smoke Test Report", 18);
+    addParagraph(`Commit: ${reportObj.commit_id || "N/A"}`);
+    addParagraph(`Branch: ${reportObj.branch || selectedBranch || "N/A"}`);
+    addParagraph(`Overall Status: ${reportObj.status || "N/A"}`);
+    y += 6;
+
+    const summary = reportObj.summary || reportObj || {};
+
+    const addSection = (title, content) => {
+      addTitle(title, 13);
+      if (Array.isArray(content)) {
+        if (content.length === 0) {
+          addParagraph("None");
+        } else {
+          content.forEach((it, idx) => {
+            const label = it.file ? `${idx + 1}. ${it.file}: ` : `${idx + 1}. `;
+            const body =
+              it.error || (it.missing && it.missing.join(", ")) || it.issue || stringifyItem(it);
+            addParagraph(label + body);
+          });
+        }
+      } else if (typeof content === "boolean") {
+        addParagraph(content ? "✅ Yes" : "❌ No");
+      } else {
+        addParagraph(stringifyItem(content || "None"));
+      }
+      y += 4;
+    };
+
+    addSection("Critical Files Present", summary.critical_files_present);
+    addSection("Build Ready for Regression", summary.build_ready_for_regression);
+
+    addSection("Syntax Errors", summary.syntax_errors || []);
+    addSection("Missing Functions", summary.missing_functions || []);
+    addSection("UI Issues", summary.ui_issues || []);
+    addSection("Error Handling Issues", summary.error_handling_issues || []);
+
+    // If LLM produced some raw text or fallback messages, include them
+    if (summary._raw_llm_output) {
+      addSection("LLM Raw Output", [ { file: "LLM", error: summary._raw_llm_output } ]);
+    }
+
+    // finalize
+    const name = `smoke_report_${reportObj.commit_id || "latest"}.pdf`;
+    doc.save(name);
+  };
+
+  // DOCX generator using docx + file-saver
+  const downloadDOCX = async (reportObj) => {
+    const summary = reportObj.summary || reportObj || {};
+
+    const children = [];
+
+    const pushParagraph = (text, bold = false) => {
+      children.push(new Paragraph({
+        children: [ new TextRun({ text: String(text), bold }) ]
+      }));
+    };
+
+    pushParagraph("Smoke Test Report", true);
+    pushParagraph(`Commit: ${reportObj.commit_id || "N/A"}`);
+    pushParagraph(`Branch: ${reportObj.branch || selectedBranch || "N/A"}`);
+    pushParagraph(`Overall Status: ${reportObj.status || "N/A"}`);
+    children.push(new Paragraph({ text: "" })); // blank line
+
+    const addArraySection = (title, arr) => {
+      pushParagraph(title, true);
+      if (!arr || arr.length === 0) {
+        pushParagraph("None");
+      } else {
+        arr.forEach((it, idx) => {
+          if (typeof it === "string") {
+            pushParagraph(`${idx + 1}. ${it}`);
+          } else {
+            const file = it.file ? `${it.file}: ` : "";
+            const body = it.error || (it.missing && it.missing.join(", ")) || it.issue || stringifyItem(it);
+            pushParagraph(`${idx + 1}. ${file}${body}`);
+          }
+        });
+      }
+      children.push(new Paragraph({ text: "" }));
+    };
+
+    const addBooleanSection = (title, val) => {
+      pushParagraph(title, true);
+      pushParagraph(val ? "✅ Yes" : "❌ No");
+      children.push(new Paragraph({ text: "" }));
+    };
+
+    addBooleanSection("Critical Files Present", summary.critical_files_present);
+    addBooleanSection("Build Ready for Regression", summary.build_ready_for_regression);
+
+    addArraySection("Syntax Errors", summary.syntax_errors || []);
+    addArraySection("Missing Functions", summary.missing_functions || []);
+    addArraySection("UI Issues", summary.ui_issues || []);
+    addArraySection("Error Handling Issues", summary.error_handling_issues || []);
+
+    if (summary._raw_llm_output) {
+      pushParagraph("LLM Raw Output", true);
+      pushParagraph(summary._raw_llm_output);
+    }
+
+    const doc = new Document({
+      sections: [{ properties: {}, children }]
+    });
+
+    const blob = await Packer.toBlob(doc);
+    saveAs(blob, `smoke_report_${reportObj.commit_id || "latest"}.docx`);
+  };
+
   // Filter repos
   const filteredRepos = repos.filter((r) =>
-    r.full_name.toLowerCase().includes(searchQuery.toLowerCase())
+    r.full_name?.toLowerCase().includes(searchQuery.toLowerCase())
   );
 
   // Empty Report Component
@@ -294,9 +449,9 @@ function App() {
                       {summary[section] && summary[section].length > 0 ? (
                         <ul className="list-disc ml-5">
                           {summary[section].map((item, idx) => (
-                            <li key={idx}>
+                            <li key={idx} className="whitespace-pre-wrap">
                               {item.file && <strong>{item.file}:</strong>}{" "}
-                              {item.error || item.missing?.join(", ") || item.issue}
+                              {item.error || (item.missing && item.missing.join(", ")) || item.issue || JSON.stringify(item)}
                             </li>
                           ))}
                         </ul>
@@ -305,6 +460,18 @@ function App() {
                   </details>
                 ))}
               </div>
+
+              {/* Download Buttons */}
+              <div className="flex gap-4 mt-6">
+                <button
+                  onClick={() => downloadDOCX(report)}
+                  className="w-1/2 bg-green-600 hover:bg-green-700 text-white font-semibold py-3 px-4 rounded-xl transition-all duration-200 shadow-lg flex items-center justify-center space-x-2"
+                >
+                  <Download className="w-5 h-5" />
+                  <span>Download DOCX</span>
+                </button>
+              </div>
+
             </div>
           ) : <EmptyReport />}
         </div>
